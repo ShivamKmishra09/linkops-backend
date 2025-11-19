@@ -6,7 +6,7 @@ import "dotenv/config";
 let redisClient;
 try {
   // Use REDIS_URL if available, otherwise fall back to local default
-  const redisUrl = process.env.REDIS_URL;
+  const redisUrl = process.env?.REDIS_URL || "redis://localhost:6379";
 
   redisClient = createClient({
     url: redisUrl,

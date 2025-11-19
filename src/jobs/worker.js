@@ -1,9 +1,10 @@
-import { Worker } from "bullmq";
+import { Worker, QueueEvents } from "bullmq";
 import "dotenv/config";
 import { Link } from "../models/Link.js";
 import { analyzeUrlContent } from "../services/aiService.js";
 import { assignLinkToSystemCollection } from "../services/systemCollectionService.js";
 // --- 1. IMPORT YOUR DATABASE CONNECTION FUNCTION ---
+import { addLinkTagsToUser } from "../services/systemCollectionService.js";
 import { connectDB } from "../db/index.js";
 
 // --- 3. CREATE AN ASYNC FUNCTION TO START THE WORKER ---
@@ -19,7 +20,21 @@ const startWorker = async () => {
     );
     process.exit(1); // Exit if DB connection fails
   }
-  const connection = process.env.REDIS_URL;
+  const connection = process.env?.REDIS_URL || "redis://localhost:6379";
+
+  const queueEvents = new QueueEvents("link-analysis", { connection });
+  queueEvents.on("waiting", ({ jobId }) =>
+    console.log("Queue event: waiting", jobId)
+  );
+  queueEvents.on("active", ({ jobId }) =>
+    console.log("Queue event: active", jobId)
+  );
+  queueEvents.on("completed", ({ jobId }) =>
+    console.log("Queue event: completed", jobId)
+  );
+  queueEvents.on("failed", ({ jobId, failedReason }) =>
+    console.log("Queue event: failed", jobId, failedReason)
+  );
 
   // --- 5. INITIALIZE THE WORKER ONLY AFTER DB IS CONNECTED ---
   const worker = new Worker(
@@ -72,13 +87,18 @@ const startWorker = async () => {
     { connection }
   );
 
-  worker.on("completed", (job) => {
-    console.log(`Job ${job.id} has completed!`);
-  });
+  worker.on("error", (err) => console.error("Worker error:", err));
+  worker.on("completed", (job) => console.log(`Job ${job.id} has completed!`));
+  worker.on("failed", (job, err) =>
+    console.log(`Job ${job.id} has failed:`, err?.message || err)
+  );
 
-  worker.on("failed", (job, err) => {
-    console.log(`Job ${job.id} has failed with ${err.message}`);
-  });
+  process.on("unhandledRejection", (reason) =>
+    console.error("UnhandledRejection in worker:", reason)
+  );
+  process.on("uncaughtException", (err) =>
+    console.error("UncaughtException in worker:", err)
+  );
 
   console.log("AI Worker started and listening for jobs...");
 };

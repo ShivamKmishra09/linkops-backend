@@ -1,5 +1,5 @@
 import { Collection } from "../models/Collection.js";
-
+import { User } from "../models/User.js";
 // System collection categories based on AI classification
 const SYSTEM_CATEGORIES = [
   "Programming/Tech Blog",
@@ -60,19 +60,31 @@ export const assignLinkToSystemCollection = async (
   aiClassification
 ) => {
   try {
-    const category = aiClassification.category;
-    const systemCollection = await getSystemCollectionByCategory(
-      userId,
-      category
+    const category = (aiClassification && aiClassification.category) || "Other";
+
+    // Try to add link to existing system collection; if not present, create it (upsert)
+    const update = {
+      $addToSet: { links: linkId },
+      $setOnInsert: {
+        name: category,
+        owner: userId,
+        isSystem: true,
+        systemCategory: category,
+        description: `Automatically organized ${category.toLowerCase()} content`,
+        color: getCategoryColor(category),
+      },
+    };
+
+    const opts = { new: true, upsert: true, setDefaultsOnInsert: true };
+
+    const systemCollection = await Collection.findOneAndUpdate(
+      { owner: userId, isSystem: true, systemCategory: category },
+      update,
+      opts
     );
 
     if (systemCollection) {
-      // Add link to system collection if not already there
-      if (!systemCollection.links.includes(linkId)) {
-        systemCollection.links.push(linkId);
-        await systemCollection.save();
-        console.log(`Assigned link ${linkId} to system collection ${category}`);
-      }
+      console.log(`Assigned link ${linkId} to system collection ${category}`);
     }
 
     return systemCollection;
@@ -103,14 +115,41 @@ const getCategoryColor = (category) => {
 
 export const addLinkTagsToUser = async (userId, linkTags) => {
   try {
-    const user = await user.findById(userId);
+    // Guard input
+    if (!userId) throw new Error("userId is required");
+    if (!Array.isArray(linkTags) || linkTags.length === 0) return;
+
+    const user = await User.findById(userId);
     if (!user) throw new Error("User not found");
-    linkTags.forEach((tag) => {
-      if (!user.LinkTags.includes(tag)) {
-        user.LinkTags.push(tag);
+
+    // Normalize existing fields (support legacy `LinkTags` or canonical `linkTags`)
+    const existing = Array.isArray(user.linkTags)
+      ? user.linkTags
+      : Array.isArray(user.LinkTags)
+      ? user.LinkTags
+      : [];
+
+    // Ensure we write to canonical field
+    user.linkTags = existing;
+
+    // Use a Set for dedupe and safe includes operations
+    const tagSet = new Set(user.linkTags.map((t) => String(t)));
+
+    for (const rawTag of linkTags) {
+      if (!rawTag) continue;
+      const tag = String(rawTag).trim();
+      if (tag === "") continue;
+      if (!tagSet.has(tag)) {
+        tagSet.add(tag);
+        user.linkTags.push(tag);
       }
-    });
+    }
+
+    // Keep legacy field in sync if present
+    user.LinkTags = user.linkTags;
+
     await user.save();
+    return user;
   } catch (error) {
     console.error("Error adding link tags to user:", error);
     throw error;

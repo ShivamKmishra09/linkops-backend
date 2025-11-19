@@ -5,6 +5,7 @@ import redisClient from "../db/redis.js";
 import { Link } from "../models/Link.js";
 import { analysisQueue } from "../jobs/queue.js";
 import { Collection } from "../models/Collection.js";
+import mongoose from "mongoose";
 
 const updateViewerCount = async (web_id) => {
   try {
@@ -133,8 +134,11 @@ export const addurl = asyncHandler(async (req, res) => {
     });
 
     if (existingLink) {
-      console.log("Link already exists for this user");
-      throw new ApiError(400, "Link already exists for this user");
+      return res.status(200).json({
+        message: "Link already exists",
+        shortUrl: `${process.env.REACT_APP_FRONTEND_URL}/linkly/${existingLink.shortId}`,
+        isCustom: existingLink.shortId === customShortId,
+      });
     }
 
     let shortId;
@@ -178,7 +182,7 @@ export const addurl = asyncHandler(async (req, res) => {
 
     // Add a job to the queue to analyze this link in the background
     await analysisQueue.add("analyze-link", { linkId: newLink._id });
-
+    console.log(`Added link analysis job for link ID: ${newLink._id}`);
     res.status(200).json({
       message: "Link added successfully",
       shortUrl: `${process.env.REACT_APP_FRONTEND_URL}/linkly/${shortId}`,
@@ -281,7 +285,35 @@ export const deleteUrl = asyncHandler(async (req, res) => {
     // First, invalidate the cache
     await redisClient.del(`link:${link.shortId}`);
 
-    // Then, delete the link from the database
+    // Remove this link from any collections that reference it
+    try {
+      // Pull the linkId from all collections owned by the user that contain it
+      await Collection.updateMany(
+        { owner: user_id, links: linkId },
+        { $pull: { links: linkId } }
+      );
+
+      // Delete any system collections that became empty after removal
+      // Note: use $size 0 to find empty 'links' arrays
+      const emptyUserCollections = await Collection.find({
+        owner: user_id,
+        isSystem: { $ne: false },
+        links: { $size: 0 },
+      });
+
+      if (emptyUserCollections && emptyUserCollections.length > 0) {
+        const idsToDelete = emptyUserCollections.map((c) => c._id);
+        await Collection.deleteMany({ _id: { $in: idsToDelete } });
+        console.log(
+          `Deleted ${idsToDelete.length} empty collections for user ${user_id}`
+        );
+      }
+    } catch (colErr) {
+      console.error("Error updating collections while deleting link:", colErr);
+      // don't block deletion of the link if collection cleanup fails
+    }
+
+    // Finally, delete the link from the database
     await Link.deleteOne({ _id: linkId });
 
     res.status(200).json({ message: "Link deleted successfully" });
@@ -406,31 +438,85 @@ export const updateLinkCollections = asyncHandler(async (req, res) => {
   if (!Array.isArray(collectionIds)) {
     throw new ApiError(400, "An array of collectionIds is required.");
   }
+  // Validate that all provided collectionIds exist and belong to the user
+  const foundCollections = await Collection.find(
+    { _id: { $in: collectionIds }, owner: user_id },
+    { _id: 1 }
+  ).lean();
 
-  // Update the link with the new array of collections
-  const link = await Link.findOneAndUpdate(
-    { _id: linkId, owner: user_id },
-    { $set: { collections: collectionIds } },
-    { new: true }
-  );
-
-  if (!link) {
-    throw new ApiError(404, "Link not found or permission denied.");
+  const foundIds = new Set(foundCollections.map((c) => String(c._id)));
+  const invalidIds = collectionIds.filter((id) => !foundIds.has(String(id)));
+  if (invalidIds.length > 0) {
+    throw new ApiError(
+      400,
+      `Some collectionIds are invalid or do not belong to the user: ${invalidIds.join(
+        ", "
+      )}`
+    );
   }
 
-  // Now, ensure consistency in the Collection models
-  // 1. Add link to the new collections
-  await Collection.updateMany(
-    { _id: { $in: collectionIds }, owner: user_id },
-    { $addToSet: { links: linkId } }
-  );
-  // 2. Remove link from any collections it's no longer in
-  await Collection.updateMany(
-    { _id: { $nin: collectionIds }, owner: user_id, links: linkId },
-    { $pull: { links: linkId } }
-  );
+  // Start a session and run the updates in a transaction for atomicity
+  const session = await mongoose.startSession();
+  let updatedLink = null;
+  let addResult = null;
+  let removeResult = null;
 
-  res
-    .status(200)
-    .json({ message: "Link collections updated successfully.", link });
+  try {
+    await session.withTransaction(async () => {
+      // 1) Update the Link document with new collection ids
+      updatedLink = await Link.findOneAndUpdate(
+        { _id: linkId, owner: user_id },
+        { $set: { collections: collectionIds } },
+        { new: true, session }
+      );
+
+      if (!updatedLink) {
+        // Throw to abort transaction
+        throw new ApiError(404, "Link not found or permission denied.");
+      }
+
+      // 2) Add link to the requested collections
+      addResult = await Collection.updateMany(
+        { _id: { $in: collectionIds }, owner: user_id },
+        { $addToSet: { links: linkId } },
+        { session }
+      );
+
+      // 3) Remove link from collections that are not in the requested set
+      removeResult = await Collection.updateMany(
+        { _id: { $nin: collectionIds }, owner: user_id, links: linkId },
+        { $pull: { links: linkId } },
+        { session }
+      );
+    });
+  } finally {
+    session.endSession();
+  }
+
+  // Invalidate the cached link object so downstream services see the updated collections
+  try {
+    if (updatedLink && updatedLink.shortId) {
+      await redisClient.del(`link:${updatedLink.shortId}`);
+    }
+  } catch (cacheErr) {
+    console.error(
+      "Failed to invalidate cache for link after updating collections:",
+      cacheErr
+    );
+    // Do not fail the API if cache invalidation fails
+  }
+
+  // Provide detailed results to the caller
+  res.status(200).json({
+    message: "Link collections updated successfully.",
+    link: updatedLink,
+    collectionUpdateSummary: {
+      addedModifiedCount: addResult
+        ? addResult.modifiedCount ?? addResult.nModified ?? null
+        : null,
+      removedModifiedCount: removeResult
+        ? removeResult.modifiedCount ?? removeResult.nModified ?? null
+        : null,
+    },
+  });
 });

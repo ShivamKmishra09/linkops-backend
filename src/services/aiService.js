@@ -111,38 +111,75 @@ async function scrapeTextFromUrl(url) {
 
 // --- ⭐ NEW: A Resilient Function to Call the AI with Retries ⭐ ---
 async function generateContentWithRetry(model, prompt) {
-  const maxRetries = 3;
-  for (let i = 0; i < maxRetries; i++) {
+  const maxRetries = 5;
+  const baseDelaySeconds = 2; // base for exponential backoff
+
+  // Helper to sleep
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       return await model.generateContent(prompt);
     } catch (error) {
-      // Check if it's a 429 rate limit error
-      if (error.status === 429) {
-        console.warn(
-          `Rate limit hit. Retrying attempt ${i + 1} of ${maxRetries}...`
-        );
-        // Extract the suggested retry delay from the error details
-        const retryDetails = error.errorDetails?.find(
-          (d) => d["@type"] === "type.googleapis.com/google.rpc.RetryInfo"
-        );
-        const delaySeconds = retryDetails
-          ? parseInt(retryDetails.retryDelay.replace("s", ""), 10)
-          : 30;
+      // Normalize status detection across error shapes
+      const status = error?.status || error?.response?.status || null;
 
-        console.log(`Waiting for ${delaySeconds} seconds before retrying.`);
-        await new Promise((resolve) =>
-          setTimeout(resolve, delaySeconds * 1000)
-        );
-      } else {
-        // For other errors (like invalid API key), throw immediately
+      // Treat 429, 503 and other 5xx as transient and retryable
+      const isTransient =
+        status === 429 || status === 503 || (status >= 500 && status < 600);
+
+      if (!isTransient) {
+        // Non-transient: rethrow immediately
         throw error;
       }
+
+      const attemptNumber = attempt + 1;
+      if (attemptNumber >= maxRetries) {
+        // Last attempt failed — throw
+        console.warn(
+          `Transient error on final attempt (${attemptNumber}):`,
+          error.message || error
+        );
+        throw error;
+      }
+
+      console.warn(
+        `Transient error (status=${status}). Retrying attempt ${attemptNumber} of ${maxRetries}...`
+      );
+
+      // Prefer server-suggested retry delay if provided (gRPC RetryInfo), else exponential backoff with jitter
+      let delaySeconds = null;
+      try {
+        const retryDetails = error?.errorDetails?.find(
+          (d) => d["@type"] === "type.googleapis.com/google.rpc.RetryInfo"
+        );
+        if (retryDetails && retryDetails.retryDelay) {
+          // retryDelay like '30s'
+          delaySeconds =
+            parseInt(
+              String(retryDetails.retryDelay).replace(/[^0-9]/g, ""),
+              10
+            ) || null;
+        }
+      } catch (e) {
+        // ignore parsing errors
+      }
+
+      if (!delaySeconds) {
+        // exponential backoff: base * 2^attempt, add jitter up to 0.5x
+        const expo = baseDelaySeconds * Math.pow(2, attempt);
+        const jitter = Math.random() * expo * 0.5;
+        delaySeconds = Math.max(1, Math.round(expo + jitter));
+      }
+
+      console.log(
+        `Waiting ${delaySeconds}s before retrying (attempt ${attemptNumber}).`
+      );
+      await sleep(delaySeconds * 1000);
     }
   }
-  // If all retries fail, throw the final error
-  throw new Error(
-    "Failed to generate content after multiple retries due to rate limiting."
-  );
+  // Shouldn't reach here, but throw defensively
+  throw new Error("Failed to generate content after multiple retries.");
 }
 
 // --- 2. MapReduce Pipeline for Long Text Summarization ---
@@ -202,7 +239,7 @@ export async function analyzeUrlContent(url) {
     };
   }
 
-  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
   try {
     let summaryData, safety, classification;
@@ -248,14 +285,15 @@ export async function analyzeUrlContent(url) {
       );
 
       const firstChunk = text.slice(0, 8000);
-      const [safetyResult, classificationResult] = await Promise.all([
-        model.generateContent(
-          safetyPromptTemplate.replace("${text}", firstChunk)
-        ),
-        model.generateContent(
-          classificationPromptTemplate.replace("${text}", firstChunk)
-        ),
-      ]);
+      // Use the retry wrapper for safety and classification calls as well
+      const safetyResult = await generateContentWithRetry(
+        model,
+        safetyPromptTemplate.replace("${text}", firstChunk)
+      );
+      const classificationResult = await generateContentWithRetry(
+        model,
+        classificationPromptTemplate.replace("${text}", firstChunk)
+      );
 
       safety = JSON.parse(
         safetyResult.response
