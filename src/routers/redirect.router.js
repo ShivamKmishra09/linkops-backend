@@ -10,10 +10,12 @@ import {
 
 import { checkForUserAuthentication } from "../middleware/auth.middleware.js";
 
+import { createLinkLimiter } from "../middleware/rateLimit.middleware.js";
+
 const router = Router();
 router
   .route("/loggedin/:user_id/redirect")
-  .patch(checkForUserAuthentication, addurl);
+  .patch(checkForUserAuthentication, createLinkLimiter, addurl);
 router
   .route("/loggedin/:user_id/urls")
   .get(checkForUserAuthentication, geturls);

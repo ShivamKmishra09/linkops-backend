@@ -294,40 +294,61 @@ export const addLinksToCollection = asyncHandler(async (req, res) => {
       `Some links not found or permission denied: ${missingIds.join(", ")}`
     );
   }
-
+const session = await mongoose.startSession();
+  let updatedCollection = null;
+  let updateResult = null;
+  
   try {
-    // Add links to collection (avoid duplicates)
-    const updatedCollection = await Collection.findByIdAndUpdate(
-      collectionId,
-      { $addToSet: { links: { $each: linkIds } } },
-      { new: true, runValidators: true }
-    );
-
-    // Update links to include this collection (avoid duplicates)
-    const updateResult = await Link.updateMany(
-      { _id: { $in: linkIds } },
-      { $addToSet: { collections: collectionId } }
-    );
-
-    if (updateResult.modifiedCount > 0) {
-      console.log(
-        `Added collection ${collectionId} to ${updateResult.modifiedCount} links`
+    await session.withTransaction(async () => {
+      // 1. ATOMIC UPDATE: Add links to collection
+      updatedCollection = await Collection.findByIdAndUpdate(
+        collectionId,
+        { $addToSet: { links: { $each: linkIds } } },
+        { new: true, runValidators: true, session: session } // 👈 Pass session to ensure atomicity
       );
-    }
 
+      if (!updatedCollection) {
+        // Must throw an error to abort the transaction
+        throw new ApiError(404, "Collection not found or permission denied (Transaction aborted).");
+      }
+
+      // 2. ATOMIC UPDATE: Update links to include this collection
+      updateResult = await Link.updateMany(
+        { _id: { $in: linkIds }, owner: user_id },
+        { $addToSet: { collections: collectionId } },
+        { session: session } // 👈 Pass session to ensure atomicity
+      );
+      
+      // We don't check updateResult.modifiedCount, but we rely on the above checks 
+      // ensuring the links exist and belong to the user.
+    });
+
+    // 3. Close the session after successful commit
+
+    // 4. Return success response
     res.status(200).json({
       success: true,
-      message: "Links added to collection successfully",
+      message: "Links added to collection successfully (Atomic)",
       collection: updatedCollection,
       addedLinks: linkIds.length,
       modifiedLinks: updateResult.modifiedCount,
     });
   } catch (error) {
+    // Ensure session is closed even on failure
+    await session.endSession(); 
+    
+    // Re-throw ApiError to be handled by asyncHandler, or wrap other errors
+    if (error instanceof ApiError) {
+        throw error;
+    }
     console.error(`Error adding links to collection ${collectionId}:`, error);
     throw new ApiError(
       500,
-      "An error occurred while adding links to the collection. Please try again."
+      "An error occurred while adding links to the collection. Transaction rolled back."
     );
+  } finally {
+    // Ensure session is closed even on failure
+    await session.endSession(); 
   }
 });
 
@@ -887,112 +908,158 @@ export const deleteCollectionEnhanced = asyncHandler(async (req, res) => {
 });
 
 // Advanced filtering endpoint
+// Advanced filtering endpoint
+// Advanced filtering endpoint
 export const filterLinks = asyncHandler(async (req, res) => {
   const { user_id } = req.params;
-  const {
-    searchQuery,
-    tags,
-    dateRange,
-    safetyScore,
-    clicks,
-    sortBy = "createdAt_desc",
-    page = 1,
-    limit = 20,
-  } = req.body;
+  console.log("filterLinks request body:", JSON.stringify(req.body, null, 2));
 
-  // Build filter query
-  const filterQuery = { owner: user_id };
+  try {
+    const {
+      searchQuery,
+      tags,
+      dateRange,
+      safetyScore,
+      clicks,
+      sortBy = "createdAt_desc",
+      page = 1,
+      limit = 20,
+    } = req.body;
 
-  // Search query
-  if (searchQuery) {
-    filterQuery.$or = [
-      { longUrl: { $regex: searchQuery, $options: "i" } },
-      { aiSummary: { $regex: searchQuery, $options: "i" } },
-    ];
-  }
-
-  // Tags filter
-  if (tags && tags.length > 0) {
-    filterQuery.aiTags = { $in: tags };
-  }
-
-  // Date range filter
-  if (dateRange) {
-    filterQuery.createdAt = {};
-    if (dateRange.startDate) {
-      filterQuery.createdAt.$gte = new Date(dateRange.startDate);
+    // Validate user_id format
+    if (!mongoose.Types.ObjectId.isValid(user_id)) {
+      throw new ApiError(400, "Invalid user ID format.");
     }
-    if (dateRange.endDate) {
-      filterQuery.createdAt.$lte = new Date(dateRange.endDate);
+
+    // Parse pagination
+    const pageNum = parseInt(page) || 1;
+    const limitNum = parseInt(limit) || 20;
+
+    // Build filter query
+    const filterQuery = { owner: user_id };
+
+    // Search query
+    if (searchQuery) {
+      filterQuery.$or = [
+        { longUrl: { $regex: searchQuery, $options: "i" } },
+        { aiSummary: { $regex: searchQuery, $options: "i" } },
+      ];
     }
+
+    // Tags filter
+    if (tags && Array.isArray(tags) && tags.length > 0) {
+      filterQuery.aiTags = { $in: tags };
+    }
+
+    // Date range filter
+    if (dateRange && (dateRange.startDate || dateRange.endDate)) {
+      const dateFilter = {};
+      let hasDateFilter = false;
+
+      if (dateRange.startDate) {
+        const startDate = new Date(dateRange.startDate);
+        if (!isNaN(startDate.getTime())) {
+          dateFilter.$gte = startDate;
+          hasDateFilter = true;
+        }
+      }
+      
+      if (dateRange.endDate) {
+        const endDate = new Date(dateRange.endDate);
+        if (!isNaN(endDate.getTime())) {
+          // Set end date to end of day (23:59:59.999)
+          endDate.setHours(23, 59, 59, 999);
+          dateFilter.$lte = endDate;
+          hasDateFilter = true;
+        }
+      }
+
+      if (hasDateFilter) {
+        filterQuery.createdAt = dateFilter;
+      }
+    }
+
+    // Safety score filter
+    if (safetyScore) {
+      const isDefault = safetyScore.min === 1 && safetyScore.max === 5;
+      if (!isDefault) {
+        const safetyFilter = {};
+        let hasSafetyFilter = false;
+
+        if (safetyScore.min !== undefined) {
+          safetyFilter.$gte = parseInt(safetyScore.min);
+          hasSafetyFilter = true;
+        }
+        if (safetyScore.max !== undefined) {
+          safetyFilter.$lte = parseInt(safetyScore.max);
+          hasSafetyFilter = true;
+        }
+
+        if (hasSafetyFilter) {
+          filterQuery.aiSafetyRating = safetyFilter;
+        }
+      }
+    }
+
+    // Clicks filter
+    if (clicks && clicks.min > 0) {
+      const clicksFilter = { $gte: parseInt(clicks.min) };
+      if (clicks.max !== undefined) {
+        clicksFilter.$lte = parseInt(clicks.max);
+      }
+      filterQuery.viewerCount = clicksFilter;
+    }
+
+    console.log("Constructed filterQuery:", JSON.stringify(filterQuery, null, 2));
+
+    // Build sort object
+    let sortObject = {};
+    switch (sortBy) {
+      case "createdAt_asc":
+        sortObject = { createdAt: 1 };
+        break;
+      case "createdAt_desc":
+        sortObject = { createdAt: -1 };
+        break;
+      case "clicks_asc":
+        sortObject = { viewerCount: 1 };
+        break;
+      case "clicks_desc":
+        sortObject = { viewerCount: -1 };
+        break;
+      case "safety_asc":
+        sortObject = { aiSafetyRating: 1 };
+        break;
+      case "safety_desc":
+        sortObject = { aiSafetyRating: -1 };
+        break;
+      default:
+        sortObject = { createdAt: -1 };
+    }
+
+    // Execute query with pagination
+    const skip = (pageNum - 1) * limitNum;
+
+    const [links, total] = await Promise.all([
+      Link.find(filterQuery).sort(sortObject).skip(skip).limit(limitNum).lean(),
+      Link.countDocuments(filterQuery),
+    ]);
+
+    res.status(200).json(
+      new ApiResponse(200, {
+        links,
+        pagination: {
+          page: pageNum,
+          limit: limitNum,
+          total,
+          pages: Math.ceil(total / limitNum),
+        },
+      })
+    );
+  } catch (error) {
+    console.error("Error in filterLinks:", error);
+    throw new ApiError(500, "Error filtering links: " + error.message);
   }
-
-  // Safety score filter
-  if (safetyScore) {
-    filterQuery.aiSafetyRating = {};
-    if (safetyScore.min !== undefined) {
-      filterQuery.aiSafetyRating.$gte = safetyScore.min;
-    }
-    if (safetyScore.max !== undefined) {
-      filterQuery.aiSafetyRating.$lte = safetyScore.max;
-    }
-  }
-
-  // Clicks filter
-  if (clicks) {
-    filterQuery.viewerCount = {};
-    if (clicks.min !== undefined) {
-      filterQuery.viewerCount.$gte = clicks.min;
-    }
-    if (clicks.max !== undefined) {
-      filterQuery.viewerCount.$lte = clicks.max;
-    }
-  }
-
-  // Build sort object
-  let sortObject = {};
-  switch (sortBy) {
-    case "createdAt_asc":
-      sortObject = { createdAt: 1 };
-      break;
-    case "createdAt_desc":
-      sortObject = { createdAt: -1 };
-      break;
-    case "clicks_asc":
-      sortObject = { viewerCount: 1 };
-      break;
-    case "clicks_desc":
-      sortObject = { viewerCount: -1 };
-      break;
-    case "safety_asc":
-      sortObject = { aiSafetyRating: 1 };
-      break;
-    case "safety_desc":
-      sortObject = { aiSafetyRating: -1 };
-      break;
-    default:
-      sortObject = { createdAt: -1 };
-  }
-
-  // Execute query with pagination
-  const skip = (page - 1) * limit;
-
-  const [links, total] = await Promise.all([
-    Link.find(filterQuery).sort(sortObject).skip(skip).limit(limit).lean(),
-    Link.countDocuments(filterQuery),
-  ]);
-
-  res.status(200).json(
-    new ApiResponse(200, {
-      links,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit),
-      },
-    })
-  );
 });
 
 // Get unique tags for a user
