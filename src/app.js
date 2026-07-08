@@ -11,6 +11,16 @@ import redisClient from "./db/redis.js"; // Import your configured Redis client
 dotenv.config();
 
 const app = express();
+const allowedOrigins = [
+  process.env.REACT_APP_FRONTEND_URL,
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+].filter(Boolean);
+
+const isAllowedOrigin = (origin) =>
+  allowedOrigins.includes(origin) ||
+  origin.startsWith("chrome-extension://") ||
+  origin.startsWith("moz-extension://");
 
 const redisStore = new RedisStore({
   client: redisClient,
@@ -32,7 +42,12 @@ app.get("/", (req, res) => res.send("Hello"));
 // Improved CORS configuration
 app.use(
   cors({
-    origin: process.env.REACT_APP_FRONTEND_URL,
+    origin(origin, callback) {
+      if (!origin || isAllowedOrigin(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error(`Origin ${origin} is not allowed by CORS`));
+    },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     credentials: true,
     allowedHeaders: [
@@ -63,8 +78,8 @@ app.use(
     saveUninitialized: true,
     cookie: {
       httpOnly: true,
-      secure: true,
-      sameSite: "none",
+      secure: process.env.NODE_ENV === "production",
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
     },
   })
 );
@@ -74,6 +89,9 @@ import SubscriptionRouter from "./routers/subscription.router.js";
 import paymentRouter from "./routers/payment.router.js";
 import redirectRouter from "./routers/redirect.router.js";
 import collectionRouter from "./routers/collection.router.js";
+import authProfileRouter from "./routers/authProfile.router.js";
+import connectorRouter from "./routers/connector.router.js";
+import knowledgeAssetRouter from "./routers/knowledgeAsset.router.js";
 
 app.use("/", SubscriptionRouter);
 app.use("/", authenticationRouter);
@@ -81,5 +99,8 @@ app.use("/", paymentRouter);
 // app.use('/',redirectRouter);
 app.use("/", redirectRouter);
 app.use("/", collectionRouter);
+app.use("/", authProfileRouter);
+app.use("/", connectorRouter);
+app.use("/", knowledgeAssetRouter);
 
 export default app;

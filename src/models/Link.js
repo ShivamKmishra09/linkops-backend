@@ -10,6 +10,7 @@ const linkSchema = new mongoose.Schema(
       required: true,
     },
     viewerCount: { type: Number, default: 0 },
+    isPublic: { type: Boolean, default: false },
     // --- New AI Fields ---
     aiSummary: { type: String, default: null },
     aiTags: { type: [String], default: [] },
@@ -24,6 +25,21 @@ const linkSchema = new mongoose.Schema(
       type: String,
       enum: ["PENDING", "COMPLETED", "FAILED"],
       default: "PENDING",
+    },
+    analysisAuthProfile: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "AuthProfile",
+      default: null,
+    },
+    analysisSnapshotText: {
+      type: String,
+      default: null,
+      maxlength: 200000,
+    },
+    analysisInputMode: {
+      type: String,
+      enum: ["URL_SCRAPE", "AUTH_PROFILE", "SNAPSHOT"],
+      default: "URL_SCRAPE",
     },
     // ... inside linkSchema
     collections: [{ type: mongoose.Schema.Types.ObjectId, ref: "Collection" }],

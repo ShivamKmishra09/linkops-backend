@@ -3,6 +3,7 @@ import {
   addurl,
   geturls,
   handleRedirect,
+  resolveShortLink,
   deleteUrl,
   editLongUrl,
   updateLinkCollections,
@@ -17,9 +18,13 @@ router
   .route("/loggedin/:user_id/redirect")
   .patch(checkForUserAuthentication, createLinkLimiter, addurl);
 router
+  .route("/loggedin/:user_id/url")
+  .post(checkForUserAuthentication, createLinkLimiter, addurl);
+router
   .route("/loggedin/:user_id/urls")
   .get(checkForUserAuthentication, geturls);
 router.route("/linkly/:web_id").get(handleRedirect);
+router.route("/linkly/:web_id/resolve").get(resolveShortLink);
 router
   .route("/loggedin/:user_id/url/:linkId")
   .patch(checkForUserAuthentication, editLongUrl) // Edits a link

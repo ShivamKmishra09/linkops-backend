@@ -46,6 +46,34 @@ PORT=8000
 # Google authentication
 REACT_APP_GOOGLE_CLIENT_ID=your_google_client_id.apps.googleusercontent.com
 GOOGLE_AUTH_PASSWORD=secure_password_for_google_auth
+
+# Google Docs & Drive connector
+GOOGLE_OAUTH_CLIENT_ID=your_google_oauth_web_client_id.apps.googleusercontent.com
+GOOGLE_OAUTH_CLIENT_SECRET=your_google_oauth_web_client_secret
+GOOGLE_OAUTH_REDIRECT_URI=http://localhost:8000/connectors/google/callback
+```
+
+### Google Docs & Drive connector setup
+
+This connector is intentionally limited to Google Docs, Sheets, Slides, and
+Drive file URLs. It does not request Gmail access, which keeps the consent flow
+lighter for hackathon/demo usage.
+
+1. In Google Cloud Console, create or select a project.
+2. Enable Google Docs API and Google Drive API.
+3. Configure the OAuth consent screen.
+4. Create an OAuth Client ID with application type `Web application`.
+5. Add this authorized redirect URI:
+```text
+http://localhost:8000/connectors/google/callback
+```
+6. Add the client ID, client secret, and redirect URI to `.env`.
+7. Restart the backend.
+
+The connector requests these scopes:
+```text
+https://www.googleapis.com/auth/documents.readonly
+https://www.googleapis.com/auth/drive.readonly
 ```
 
 ## Installation

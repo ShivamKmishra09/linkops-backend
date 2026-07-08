@@ -5,6 +5,10 @@ import { ApiResponse } from "../utilities/ApiResponse.js";
 import { asyncHandler } from "../utilities/asyncHandler.js";
 import mongoose from "mongoose";
 import { User } from "../models/User.js";
+import {
+  getOptionalUserIdFromRequest,
+  hasApprovedAccess,
+} from "../services/accessService.js";
 
 // --- CREATE a new, empty collection ---
 export const createCollection = asyncHandler(async (req, res) => {
@@ -29,7 +33,7 @@ export const createCollection = asyncHandler(async (req, res) => {
   }
 
   // Check for potentially harmful characters (basic XSS prevention)
-  const harmfulPattern = /[<>\"'&]/;
+  const harmfulPattern = /[<>]/;
   if (harmfulPattern.test(sanitizedName)) {
     throw new ApiError(400, "Collection name contains invalid characters.");
   }
@@ -204,7 +208,7 @@ export const updateCollection = asyncHandler(async (req, res) => {
   }
 
   // Check for potentially harmful characters (basic XSS prevention)
-  const harmfulPattern = /[<>\"'&]/;
+  const harmfulPattern = /[<>]/;
   if (harmfulPattern.test(sanitizedName)) {
     throw new ApiError(400, "Collection name contains invalid characters.");
   }
@@ -577,14 +581,14 @@ export const getDashboardData = asyncHandler(async (req, res) => {
       Link.find({ owner: user_id })
         .sort({ createdAt: -1 })
         .select(
-          "shortId longUrl viewerCount analysisStatus aiSummary aiTags aiSafetyRating aiClassification createdAt"
+          "shortId longUrl viewerCount collections analysisStatus analysisInputMode aiSummary aiTags aiSafetyRating aiClassification createdAt updatedAt"
         )
         .lean(),
 
       // Get all user's collections with populated link counts
       Collection.find({ owner: user_id })
         .sort({ name: 1 })
-        .select("name links createdAt updatedAt")
+        .select("name links isSystem systemCategory isPublic createdAt updatedAt")
         .lean(),
     ]);
 
@@ -632,6 +636,174 @@ export const getDashboardData = asyncHandler(async (req, res) => {
       "An error occurred while fetching dashboard data. Please try again."
     );
   }
+});
+
+export const shareCollection = asyncHandler(async (req, res) => {
+  const { collectionId, user_id } = req.params;
+  const { isPublic = true } = req.body;
+
+  if (
+    !mongoose.Types.ObjectId.isValid(collectionId) ||
+    !mongoose.Types.ObjectId.isValid(user_id)
+  ) {
+    throw new ApiError(400, "Invalid ID format.");
+  }
+
+  const collection = await Collection.findOneAndUpdate(
+    { _id: collectionId, owner: user_id },
+    { isPublic: Boolean(isPublic) },
+    { new: true, runValidators: true }
+  ).lean();
+
+  if (!collection) {
+    throw new ApiError(404, "Collection not found or permission denied.");
+  }
+
+  res.status(200).json({
+    success: true,
+    message: collection.isPublic
+      ? "Collection sharing enabled"
+      : "Collection sharing disabled",
+    collection,
+    shareUrl: collection.isPublic
+      ? `${process.env.REACT_APP_FRONTEND_URL}/shared/collections/${collection._id}`
+      : null,
+  });
+});
+
+export const getSharedCollection = asyncHandler(async (req, res) => {
+  const { collectionId } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(collectionId)) {
+    throw new ApiError(400, "Invalid collection ID format.");
+  }
+
+  const collection = await Collection.findById(collectionId)
+    .select("name description links owner isPublic createdAt updatedAt")
+    .populate(
+      "links",
+      "shortId longUrl viewerCount analysisStatus aiSummary aiTags aiSafetyRating aiClassification createdAt"
+    )
+    .lean();
+
+  if (!collection) {
+    throw new ApiError(404, "Shared collection not found.");
+  }
+
+  const viewerId = getOptionalUserIdFromRequest(req);
+  const isOwner = viewerId && String(collection.owner) === String(viewerId);
+  const approved = await hasApprovedAccess({
+    resourceType: "collection",
+    resourceId: collection._id,
+    userId: viewerId,
+  });
+
+  if (!collection.isPublic && !isOwner && !approved) {
+    return res.status(200).json({
+      success: false,
+      requiresApproval: true,
+      collection: {
+        _id: collection._id,
+        name: collection.name,
+        isPublic: false,
+      },
+      message: "This collection is private. Request access from the owner.",
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    collection,
+  });
+});
+
+const generateImportedShortId = async () => {
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const shortId = Array.from({ length: 7 }, () =>
+      chars.charAt(Math.floor(Math.random() * chars.length))
+    ).join("");
+    const existing = await Link.findOne({ shortId });
+    if (!existing) return shortId;
+  }
+  return `${Date.now().toString(36)}${Math.random()
+    .toString(36)
+    .slice(2, 4)}`.slice(0, 9);
+};
+
+export const importSharedCollection = asyncHandler(async (req, res) => {
+  const { collectionId } = req.params;
+  const { user_id } = req.params;
+
+  if (
+    !mongoose.Types.ObjectId.isValid(collectionId) ||
+    !mongoose.Types.ObjectId.isValid(user_id)
+  ) {
+    throw new ApiError(400, "Invalid ID format.");
+  }
+
+  const sourceCollection = await Collection.findById(collectionId).populate(
+    "links"
+  );
+
+  if (!sourceCollection) {
+    throw new ApiError(404, "Collection not found.");
+  }
+
+  if (String(sourceCollection.owner) === String(user_id)) {
+    throw new ApiError(400, "You already own this collection.");
+  }
+
+  const approved = await hasApprovedAccess({
+    resourceType: "collection",
+    resourceId: sourceCollection._id,
+    userId: user_id,
+  });
+
+  if (!sourceCollection.isPublic && !approved) {
+    throw new ApiError(403, "Access approval is required before importing.");
+  }
+
+  const baseName = sourceCollection.name;
+  let targetName = baseName;
+  let suffix = 1;
+  while (await Collection.findOne({ owner: user_id, name: targetName })) {
+    suffix += 1;
+    targetName = `${baseName} (${suffix})`;
+  }
+
+  const importedCollection = await Collection.create({
+    name: targetName,
+    owner: user_id,
+    links: [],
+  });
+
+  const importedLinks = [];
+  for (const sourceLink of sourceCollection.links || []) {
+    const importedLink = await Link.create({
+      shortId: await generateImportedShortId(),
+      longUrl: sourceLink.longUrl,
+      owner: user_id,
+      aiSummary: sourceLink.aiSummary,
+      aiTags: sourceLink.aiTags,
+      aiSafetyRating: sourceLink.aiSafetyRating,
+      aiSafetyJustification: sourceLink.aiSafetyJustification,
+      aiClassification: sourceLink.aiClassification,
+      analysisStatus: sourceLink.analysisStatus,
+      collections: [importedCollection._id],
+    });
+    importedLinks.push(importedLink._id);
+  }
+
+  importedCollection.links = importedLinks;
+  await importedCollection.save();
+
+  res.status(201).json({
+    success: true,
+    message: "Collection added to your workspace.",
+    collection: importedCollection,
+    importedLinks: importedLinks.length,
+  });
 });
 
 // --- BULK ADD links to collection ---

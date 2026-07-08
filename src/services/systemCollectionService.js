@@ -2,18 +2,19 @@ import { Collection } from "../models/Collection.js";
 import { User } from "../models/User.js";
 // System collection categories based on AI classification
 const SYSTEM_CATEGORIES = [
-  "Programming/Tech Blog",
-  "Documentation/Reference",
-  "Research/Academic",
-  "News/Current Affairs",
-  "Learning/Education",
-  "Product/Service Page",
-  "E-commerce/Marketplace",
-  "Social Media/Forum",
-  "Entertainment/Media",
-  "Scam/Phishing/Unsafe",
-  "Other",
+  "GitHub Repos & PRs",
+  "Confluence Docs",
+  "Google Docs & Sheets",
+  "Figma Designs",
+  "KRD / PRD Docs",
+  "Dashboards & Reports",
+  "SOPs & Runbooks",
+  "Incidents & RCA",
+  "Onboarding Docs",
+  "Other Work Links",
 ];
+
+const SYSTEM_CATEGORY_SET = new Set(SYSTEM_CATEGORIES);
 
 // Create system collections for a new user
 export const createSystemCollections = async (userId) => {
@@ -60,7 +61,11 @@ export const assignLinkToSystemCollection = async (
   aiClassification
 ) => {
   try {
-    const category = (aiClassification && aiClassification.category) || "Other";
+    const rawCategory =
+      (aiClassification && aiClassification.category) || "Other Work Links";
+    const category = SYSTEM_CATEGORY_SET.has(rawCategory)
+      ? rawCategory
+      : "Other Work Links";
 
     // Try to add link to existing system collection; if not present, create it (upsert)
     const update = {
@@ -97,17 +102,16 @@ export const assignLinkToSystemCollection = async (
 // Get color for each category
 const getCategoryColor = (category) => {
   const colorMap = {
-    "Programming/Tech Blog": "#3B82F6", // Blue
-    "Documentation/Reference": "#10B981", // Green
-    "Research/Academic": "#8B5CF6", // Purple
-    "News/Current Affairs": "#EF4444", // Red
-    "Learning/Education": "#F59E0B", // Amber
-    "Product/Service Page": "#06B6D4", // Cyan
-    "E-commerce/Marketplace": "#84CC16", // Lime
-    "Social Media/Forum": "#EC4899", // Pink
-    "Entertainment/Media": "#F97316", // Orange
-    "Scam/Phishing/Unsafe": "#DC2626", // Dark Red
-    Other: "#6B7280", // Gray
+    "GitHub Repos & PRs": "#3B82F6",
+    "Confluence Docs": "#06B6D4",
+    "Google Docs & Sheets": "#22C55E",
+    "Figma Designs": "#EC4899",
+    "KRD / PRD Docs": "#8B5CF6",
+    "Dashboards & Reports": "#10B981",
+    "SOPs & Runbooks": "#F59E0B",
+    "Incidents & RCA": "#EF4444",
+    "Onboarding Docs": "#14B8A6",
+    "Other Work Links": "#6B7280",
   };
 
   return colorMap[category] || "#6B7280";

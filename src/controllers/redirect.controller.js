@@ -6,6 +6,12 @@ import { Link } from "../models/Link.js";
 import { analysisQueue } from "../jobs/queue.js";
 import { Collection } from "../models/Collection.js";
 import mongoose from "mongoose";
+import { publishUserEvent } from "../services/realtimeService.js";
+import {
+  getOptionalUserIdFromRequest,
+  hasApprovedAccess,
+} from "../services/accessService.js";
+import { getUsableAuthProfile } from "../services/authProfileService.js";
 
 const updateViewerCount = async (web_id) => {
   try {
@@ -73,7 +79,24 @@ export const handleRedirect = asyncHandler(async (req, res) => {
     // 2a. CACHE HIT: Parse the JSON string from the cache
     linkData = JSON.parse(cachedData);
     // Asynchronously update the viewer count
-    Link.updateOne({ shortId: web_id }, { $inc: { viewerCount: 1 } }).exec();
+    Link.findOneAndUpdate(
+      { shortId: web_id },
+      { $inc: { viewerCount: 1 } },
+      { new: true }
+    )
+      .lean()
+      .then((updatedLink) => {
+        if (updatedLink) {
+          publishUserEvent(updatedLink.owner, {
+            type: "link-updated",
+            reason: "viewer-count",
+            link: updatedLink,
+          });
+        }
+      })
+      .catch((error) =>
+        console.error(`Failed to publish viewer count for ${web_id}:`, error)
+      );
   } else {
     // 2b. CACHE MISS: Query the database
     const link = await Link.findOne({ shortId: web_id });
@@ -83,11 +106,20 @@ export const handleRedirect = asyncHandler(async (req, res) => {
 
     link.viewerCount += 1;
     await link.save();
+    await publishUserEvent(link.owner, {
+      type: "link-updated",
+      reason: "viewer-count",
+      link: link.toObject(),
+    });
 
     // 3. Cache the entire link object as a JSON string
     // We use lean() to get a plain JS object to avoid caching Mongoose methods
     linkData = link.toObject();
     await redisClient.set(cacheKey, JSON.stringify(linkData), "EX", 3600);
+  }
+
+  if (!linkData.isPublic) {
+    return res.redirect(302, `${process.env.REACT_APP_FRONTEND_URL}/linkly/${web_id}`);
   }
 
   // --- 4. THE NEW SAFETY CHECK ---
@@ -108,9 +140,71 @@ export const handleRedirect = asyncHandler(async (req, res) => {
   return res.redirect(302, linkData.longUrl);
 });
 
+export const resolveShortLink = asyncHandler(async (req, res) => {
+  const { web_id } = req.params;
+  const viewerId = getOptionalUserIdFromRequest(req);
+  const link = await Link.findOne({ shortId: web_id }).lean();
+
+  if (!link) {
+    throw new ApiError(404, "Link not found.");
+  }
+
+  const isOwner = viewerId && String(link.owner) === String(viewerId);
+  const approved = await hasApprovedAccess({
+    resourceType: "link",
+    resourceId: link._id,
+    userId: viewerId,
+  });
+
+  if (!link.isPublic && !isOwner && !approved) {
+    return res.status(200).json({
+      success: false,
+      requiresApproval: true,
+      link: {
+        shortId: link.shortId,
+      },
+      message: "This short link is private. Request access from the owner.",
+    });
+  }
+
+  await Link.findOneAndUpdate(
+    { shortId: web_id },
+    { $inc: { viewerCount: 1 } },
+    { new: true }
+  )
+    .lean()
+    .then((updatedLink) => {
+      if (updatedLink) {
+        publishUserEvent(updatedLink.owner, {
+          type: "link-updated",
+          reason: "viewer-count",
+          link: updatedLink,
+        });
+      }
+    });
+
+  res.status(200).json({
+    success: true,
+    longUrl: link.longUrl,
+    link,
+  });
+});
+
 export const addurl = asyncHandler(async (req, res) => {
   try {
-    const { oldLink, customShortId } = req.body;
+    const {
+      oldLink: legacyOldLink,
+      longUrl,
+      customShortId,
+      collectionIds = [],
+      authProfileId = null,
+      analysisSnapshotText = "",
+    } = req.body;
+    const oldLink = (longUrl || legacyOldLink || "").trim();
+    const sanitizedSnapshotText =
+      typeof analysisSnapshotText === "string"
+        ? analysisSnapshotText.replace(/\s\s+/g, " ").trim()
+        : "";
     const user_id = req.params.user_id;
     const user = await User.findById(user_id);
 
@@ -127,6 +221,43 @@ export const addurl = asyncHandler(async (req, res) => {
       );
     }
 
+    if (!Array.isArray(collectionIds)) {
+      throw new ApiError(400, "collectionIds must be an array.");
+    }
+
+    if (collectionIds.length > 0) {
+      const foundCollections = await Collection.find({
+        _id: { $in: collectionIds },
+        owner: user_id,
+        isSystem: { $ne: true },
+      }).select("_id");
+
+      if (foundCollections.length !== collectionIds.length) {
+        throw new ApiError(
+          400,
+          "Some selected collections are invalid or do not belong to you."
+        );
+      }
+    }
+
+    if (
+      sanitizedSnapshotText &&
+      (sanitizedSnapshotText.length < 100 || sanitizedSnapshotText.length > 200000)
+    ) {
+      throw new ApiError(
+        400,
+        "Private page snapshot must be between 100 and 200,000 characters."
+      );
+    }
+
+    const authProfile = authProfileId
+      ? await getUsableAuthProfile({
+          ownerId: user_id,
+          authProfileId,
+          url: oldLink,
+        })
+      : null;
+
     // Check if link already exists for this user
     const existingLink = await Link.findOne({
       longUrl: oldLink,
@@ -134,9 +265,61 @@ export const addurl = asyncHandler(async (req, res) => {
     });
 
     if (existingLink) {
+      const hasConnectorCandidate =
+        oldLink.includes("atlassian.net") ||
+        oldLink.includes("github.com") ||
+        oldLink.includes("docs.google.com") ||
+        oldLink.includes("drive.google.com");
+      const shouldRefreshAnalysis = Boolean(
+        sanitizedSnapshotText || authProfile || hasConnectorCandidate
+      );
+
+      if (sanitizedSnapshotText) {
+        existingLink.analysisSnapshotText = sanitizedSnapshotText;
+        existingLink.analysisInputMode = "SNAPSHOT";
+      } else if (authProfile) {
+        existingLink.analysisAuthProfile = authProfile._id;
+        existingLink.analysisInputMode = "AUTH_PROFILE";
+      } else if (hasConnectorCandidate) {
+        existingLink.analysisSnapshotText = null;
+        existingLink.analysisInputMode = "URL_SCRAPE";
+      }
+
+      if (collectionIds.length > 0) {
+        existingLink.collections = Array.from(
+          new Set([
+            ...(existingLink.collections || []).map((id) => String(id)),
+            ...collectionIds.map((id) => String(id)),
+          ])
+        );
+        await Collection.updateMany(
+          { _id: { $in: collectionIds }, owner: user_id },
+          { $addToSet: { links: existingLink._id } }
+        );
+      }
+
+      if (shouldRefreshAnalysis) {
+        existingLink.analysisStatus = "PENDING";
+      }
+
+      await existingLink.save();
+
+      if (shouldRefreshAnalysis) {
+        await analysisQueue.add("analyze-link", { linkId: existingLink._id });
+        await publishUserEvent(user_id, {
+          type: "link-updated",
+          reason: "analysis-refresh-requested",
+          link: existingLink.toObject(),
+          refreshDashboard: true,
+        });
+      }
+
       return res.status(200).json({
-        message: "Link already exists",
+        message: shouldRefreshAnalysis
+          ? "Link refreshed successfully"
+          : "Link already exists",
         shortUrl: `${process.env.REACT_APP_FRONTEND_URL}/linkly/${existingLink.shortId}`,
+        link: existingLink,
         isCustom: existingLink.shortId === customShortId,
       });
     }
@@ -176,16 +359,37 @@ export const addurl = asyncHandler(async (req, res) => {
       shortId,
       longUrl: oldLink,
       owner: user_id,
+      collections: collectionIds,
+      analysisAuthProfile: authProfile?._id || null,
+      analysisSnapshotText: sanitizedSnapshotText || null,
+      analysisInputMode: sanitizedSnapshotText
+        ? "SNAPSHOT"
+        : authProfile
+          ? "AUTH_PROFILE"
+          : "URL_SCRAPE",
     });
 
     await newLink.save();
 
+    if (collectionIds.length > 0) {
+      await Collection.updateMany(
+        { _id: { $in: collectionIds }, owner: user_id },
+        { $addToSet: { links: newLink._id } }
+      );
+    }
+
     // Add a job to the queue to analyze this link in the background
     await analysisQueue.add("analyze-link", { linkId: newLink._id });
     console.log(`Added link analysis job for link ID: ${newLink._id}`);
+    await publishUserEvent(user_id, {
+      type: "link-created",
+      reason: "created",
+      link: newLink.toObject(),
+    });
     res.status(200).json({
       message: "Link added successfully",
       shortUrl: `${process.env.REACT_APP_FRONTEND_URL}/linkly/${shortId}`,
+      link: newLink,
       isCustom: !!customShortId,
     });
   } catch (err) {
@@ -419,6 +623,11 @@ export const editLongUrl = asyncHandler(async (req, res) => {
     // Add a new job to the queue to re-analyze the updated link
     // Make sure 'analysisQueue' is imported from '../jobs/queue.js'
     await analysisQueue.add("analyze-link", { linkId: link._id });
+    await publishUserEvent(user_id, {
+      type: "link-updated",
+      reason: "edited",
+      link: link.toObject(),
+    });
 
     res.status(200).json({ message: "Link updated successfully", link });
   } catch (err) {
@@ -455,42 +664,39 @@ export const updateLinkCollections = asyncHandler(async (req, res) => {
     );
   }
 
-  // Start a session and run the updates in a transaction for atomicity
-  const session = await mongoose.startSession();
   let updatedLink = null;
   let addResult = null;
   let removeResult = null;
 
   try {
-    await session.withTransaction(async () => {
-      // 1) Update the Link document with new collection ids
-      updatedLink = await Link.findOneAndUpdate(
-        { _id: linkId, owner: user_id },
-        { $set: { collections: collectionIds } },
-        { new: true, session }
-      );
+    updatedLink = await Link.findOneAndUpdate(
+      { _id: linkId, owner: user_id },
+      { $set: { collections: collectionIds } },
+      { new: true }
+    );
 
-      if (!updatedLink) {
-        // Throw to abort transaction
-        throw new ApiError(404, "Link not found or permission denied.");
-      }
+    if (!updatedLink) {
+      throw new ApiError(404, "Link not found or permission denied.");
+    }
 
-      // 2) Add link to the requested collections
-      addResult = await Collection.updateMany(
-        { _id: { $in: collectionIds }, owner: user_id },
-        { $addToSet: { links: linkId } },
-        { session }
-      );
+    addResult = await Collection.updateMany(
+      { _id: { $in: collectionIds }, owner: user_id },
+      { $addToSet: { links: linkId } }
+    );
 
-      // 3) Remove link from collections that are not in the requested set
-      removeResult = await Collection.updateMany(
-        { _id: { $nin: collectionIds }, owner: user_id, links: linkId },
-        { $pull: { links: linkId } },
-        { session }
-      );
-    });
-  } finally {
-    session.endSession();
+    removeResult = await Collection.updateMany(
+      { _id: { $nin: collectionIds }, owner: user_id, links: linkId },
+      { $pull: { links: linkId } }
+    );
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+    console.error("Error updating link collections:", error);
+    throw new ApiError(
+      500,
+      "An error occurred while updating link collections."
+    );
   }
 
   // Invalidate the cached link object so downstream services see the updated collections
@@ -505,6 +711,13 @@ export const updateLinkCollections = asyncHandler(async (req, res) => {
     );
     // Do not fail the API if cache invalidation fails
   }
+
+  await publishUserEvent(user_id, {
+    type: "link-updated",
+    reason: "collections-updated",
+    link: updatedLink.toObject(),
+    refreshDashboard: true,
+  });
 
   // Provide detailed results to the caller
   res.status(200).json({

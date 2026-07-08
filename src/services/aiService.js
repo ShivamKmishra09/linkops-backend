@@ -1,6 +1,11 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import puppeteer from "puppeteer";
 import "dotenv/config";
+import {
+  applyAuthProfileToPage,
+  markAuthProfileFailed,
+} from "./authProfileService.js";
+import { fetchConnectorContentForUrl } from "./connectorService.js";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -55,21 +60,33 @@ const safetyPromptTemplate = `You are a security and safety auditor for web cont
     Here is the scraped content from the URL: """\${text}"""`;
 
 const classificationPromptTemplate = `
-      You are a web content classifier. 
-      Your job is to analyze scraped webpage content and classify it into a predefined category.
+      You are a Meesho internal knowledge operations classifier.
+      Your job is to analyze scraped webpage content and classify the link into the simple work-artifact collection where a Meesho employee would most likely search for it later.
+      Prefer the source/artifact type over complex business-domain guessing.
 
       Categories:
-      - Programming/Tech Blog
-      - Documentation/Reference
-      - Research/Academic
-      - News/Current Affairs
-      - Learning/Education
-      - Product/Service Page
-      - E-commerce/Marketplace
-      - Social Media/Forum
-      - Entertainment/Media
-      - Scam/Phishing/Unsafe
-      - Other
+      - GitHub Repos & PRs
+      - Confluence Docs
+      - Google Docs & Sheets
+      - Figma Designs
+      - KRD / PRD Docs
+      - Dashboards & Reports
+      - SOPs & Runbooks
+      - Incidents & RCA
+      - Onboarding Docs
+      - Other Work Links
+
+      Guidance:
+      - Use "GitHub Repos & PRs" for GitHub repositories, pull requests, issues, code files, or engineering repo pages.
+      - Use "Confluence Docs" for Confluence/wiki pages unless the text clearly identifies a KRD, PRD, SOP, runbook, incident, or RCA.
+      - Use "Google Docs & Sheets" for Google Docs, Sheets, Slides, or Drive documents unless the text clearly identifies a KRD, PRD, SOP, runbook, incident, or RCA.
+      - Use "Figma Designs" for Figma files, mocks, design specs, prototypes, UX flows, or visual design links.
+      - Use "KRD / PRD Docs" for knowledge requirement documents, product requirement documents, strategy specs, feature specs, or planning docs.
+      - Use "Dashboards & Reports" for dashboards, analytics reports, metrics, sheets primarily used for reporting, and BI views.
+      - Use "SOPs & Runbooks" for process steps, operations SOPs, engineering runbooks, troubleshooting guides, and execution playbooks.
+      - Use "Incidents & RCA" for incident docs, war-room links, postmortems, RCAs, and outage analysis.
+      - Use "Onboarding Docs" for onboarding, training, getting-started, or team intro content.
+      - Use "Other Work Links" when none of the above clearly fit.
       Return your output ONLY as a valid JSON object, nothing else. 
       Do not include explanations or extra text outside the JSON. 
       JSON schema:
@@ -83,8 +100,9 @@ const classificationPromptTemplate = `
       `;
 
 // --- 1. Puppeteer Web Scraper (Unchanged) ---
-async function scrapeTextFromUrl(url) {
+async function scrapeTextFromUrl(url, options = {}) {
   let browser = null;
+  let appliedAuthProfile = null;
   try {
     console.log(`Launching headless browser to scrape: ${url}`);
     browser = await puppeteer.launch({
@@ -95,13 +113,34 @@ async function scrapeTextFromUrl(url) {
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     );
+    if (options.authProfileId) {
+      appliedAuthProfile = await applyAuthProfileToPage({
+        page,
+        ownerId: options.ownerId,
+        authProfileId: options.authProfileId,
+        url,
+      });
+      console.log(
+        `Applied auth profile ${appliedAuthProfile?._id} for ${appliedAuthProfile?.hostname}`
+      );
+    }
     await page.goto(url, { waitUntil: "networkidle0", timeout: 30000 });
     const textContent = await page.evaluate(() => document.body.innerText);
     console.log(`Successfully scraped ${textContent.length} characters.`);
-    return textContent.replace(/\s\s+/g, " ").trim();
+    return {
+      text: textContent.replace(/\s\s+/g, " ").trim(),
+      usedAuthProfile: Boolean(appliedAuthProfile),
+    };
   } catch (error) {
     console.error(`Puppeteer scraping failed for URL: ${url}`, error.message);
-    return null;
+    if (options.authProfileId) {
+      await markAuthProfileFailed(options.authProfileId, error.message);
+    }
+    return {
+      text: null,
+      authError: options.authProfileId ? error.message : null,
+      usedAuthProfile: Boolean(options.authProfileId),
+    };
   } finally {
     if (browser) {
       await browser.close();
@@ -218,23 +257,83 @@ async function getSummarizationFromChunks(text, model, finalSummaryUserPrompt) {
 }
 
 // --- 3. FINAL AI Analysis Function with Conditional Logic ---
-export async function analyzeUrlContent(url) {
-  const text = await scrapeTextFromUrl(url);
-  const characterThreshold = 4000; // Approx. 1000 tokens
+export async function analyzeUrlContent(url, options = {}) {
+  const snapshotText =
+    typeof options.textOverride === "string"
+      ? options.textOverride.replace(/\s\s+/g, " ").trim()
+      : "";
+  const connectorResult =
+    !snapshotText && options.ownerId
+      ? await fetchConnectorContentForUrl({ ownerId: options.ownerId, url })
+      : null;
+  const scrapeResult = snapshotText
+    ? { text: snapshotText, usedSnapshot: true }
+    : connectorResult?.text
+        ? {
+            text: connectorResult.text,
+            usedConnector: true,
+            connectorSource: connectorResult.source,
+          }
+      : connectorResult?.attempted
+        ? {
+            text: null,
+            usedConnector: true,
+            connectorSource: connectorResult.source,
+            connectorError: connectorResult.error,
+          }
+    : await scrapeTextFromUrl(url, options);
+  const text = scrapeResult?.text;
+  const characterThreshold = scrapeResult?.usedConnector ? 30 : 100;
 
-  if (!text || text.length < 100) {
+  if (!text || text.length < characterThreshold) {
+    const authenticatedMessage = scrapeResult?.usedAuthProfile
+      ? "Authenticated analysis could not extract enough content. The auth profile may be expired, the account may not have access, or the page may require an extra approval/MFA step."
+      : scrapeResult?.usedSnapshot
+        ? "The pasted private page snapshot did not contain enough readable content for AI analysis."
+        : scrapeResult?.usedConnector
+          ? scrapeResult?.connectorError
+            ? `Connector could not read this URL: ${scrapeResult.connectorError}`
+            : `The ${scrapeResult.connectorSource || "configured"} connector returned too little readable content for AI analysis.`
+      : "Could not extract sufficient text content from this URL.";
+
     return {
-      summary: "Could not extract sufficient text content from this URL.",
+      summary: authenticatedMessage,
       tags: [],
       safety: {
         safety_rating: 3,
         justification:
+          scrapeResult?.authError ||
+          scrapeResult?.connectorError ||
           "Unable to analyze content. The page may be an image, a login wall, or a complex application.",
       },
       classification: {
-        category: "Other",
+        category: "Other Work Links",
         confidence: 0.5,
-        reason: "Could not scrape content.",
+        reason: scrapeResult?.usedAuthProfile
+          ? "Authenticated scrape did not return enough readable content."
+          : scrapeResult?.usedSnapshot
+            ? "Private page snapshot was too short or not readable enough."
+            : scrapeResult?.usedConnector
+              ? "Connector content was too short or not readable enough."
+          : "Could not scrape content.",
+      },
+    };
+  }
+
+  if (!process.env.GEMINI_API_KEY) {
+    return {
+      summary:
+        "AI analysis is disabled because GEMINI_API_KEY is not configured. The link was saved and can still be organized manually.",
+      tags: ["manual-review"],
+      safety: {
+        safety_rating: 3,
+        justification:
+          "No Gemini API key is configured, so automated safety analysis was skipped.",
+      },
+      classification: {
+        category: "Other Work Links",
+        confidence: 0.5,
+        reason: "AI classification skipped because GEMINI_API_KEY is missing.",
       },
     };
   }

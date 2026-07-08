@@ -6,6 +6,11 @@ import { assignLinkToSystemCollection } from "../services/systemCollectionServic
 // --- 1. IMPORT YOUR DATABASE CONNECTION FUNCTION ---
 import { addLinkTagsToUser } from "../services/systemCollectionService.js";
 import { connectDB } from "../db/index.js";
+import { publishUserEvent } from "../services/realtimeService.js";
+import {
+  markKnowledgeAssetFailed,
+  upsertKnowledgeAssetFromAnalysis,
+} from "../services/knowledgeAssetService.js";
 
 // --- 3. CREATE AN ASYNC FUNCTION TO START THE WORKER ---
 const startWorker = async () => {
@@ -48,13 +53,18 @@ const startWorker = async () => {
         const link = await Link.findById(linkId);
         if (!link) throw new Error("Link not found");
 
-        const analysisResult = await analyzeUrlContent(link.longUrl);
+        const analysisResult = await analyzeUrlContent(link.longUrl, {
+          ownerId: link.owner,
+          authProfileId: link.analysisAuthProfile,
+          textOverride: link.analysisSnapshotText,
+        });
         console.log(analysisResult);
 
         link.aiSummary = analysisResult.summary;
         link.aiTags = analysisResult.tags;
         link.aiSafetyRating = analysisResult.safety.safety_rating;
-        link.aiSafetyJustification = analysisResult.safety.explanation;
+        link.aiSafetyJustification =
+          analysisResult.safety.justification || analysisResult.safety.explanation;
         link.aiClassification = {
           category: analysisResult.classification.category,
           confidence: analysisResult.classification.confidence,
@@ -63,6 +73,16 @@ const startWorker = async () => {
         link.analysisStatus = "COMPLETED";
 
         await link.save();
+
+        let knowledgeAsset = null;
+        try {
+          knowledgeAsset = await upsertKnowledgeAssetFromAnalysis({
+            link,
+            analysisResult,
+          });
+        } catch (error) {
+          console.error("Failed to upsert knowledge asset:", error);
+        }
 
         // Automatically assign link to appropriate system collection
         try {
@@ -79,9 +99,38 @@ const startWorker = async () => {
         } catch (error) {
           console.error("Failed to add link tags to user:", error);
         }
+        await publishUserEvent(link.owner, {
+          type: "link-updated",
+          reason: "analysis-completed",
+          link: link.toObject(),
+          asset: knowledgeAsset,
+          refreshDashboard: true,
+        });
       } catch (error) {
         console.error(`Job failed for linkId: ${linkId}`, error);
-        await Link.findByIdAndUpdate(linkId, { analysisStatus: "FAILED" });
+        const failedLink = await Link.findByIdAndUpdate(
+          linkId,
+          { analysisStatus: "FAILED" },
+          { new: true }
+        ).lean();
+        if (failedLink) {
+          let knowledgeAsset = null;
+          try {
+            knowledgeAsset = await markKnowledgeAssetFailed({
+              link: failedLink,
+              errorMessage: error?.message || "Analysis failed",
+            });
+          } catch (assetError) {
+            console.error("Failed to mark knowledge asset failed:", assetError);
+          }
+
+          await publishUserEvent(failedLink.owner, {
+            type: "link-updated",
+            reason: "analysis-failed",
+            link: failedLink,
+            asset: knowledgeAsset,
+          });
+        }
       }
     },
     { connection }
