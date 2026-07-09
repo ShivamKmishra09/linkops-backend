@@ -5,125 +5,133 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { createSystemCollections } from "../services/systemCollectionService.js";
 
+const ALLOWED_EMAIL_DOMAIN = "@meesho.com";
+
+const normalizeEmail = (email = "") => String(email).trim().toLowerCase();
+
+const assertMeeshoEmail = (email) => {
+  const normalizedEmail = normalizeEmail(email);
+
+  if (!normalizedEmail) {
+    throw new ApiError(400, "Email is required");
+  }
+
+  if (!normalizedEmail.endsWith(ALLOWED_EMAIL_DOMAIN)) {
+    throw new ApiError(
+      403,
+      "LinkOps is currently available only for @meesho.com work emails."
+    );
+  }
+
+  return normalizedEmail;
+};
+
+const signAuthToken = (user) =>
+  jwt.sign(
+    {
+      email: user.email,
+      userId: user._id,
+      emailVerified: Boolean(user.emailVerified),
+    },
+    process.env.JWT_KEY
+  );
+
 export const registerUser = asyncHandler(async (req, res) => {
   const { username, email, password } = req.body;
-  if (!username || username.trim() === "") throw new ApiError(500, "Name is required");
-  if (!email || email.trim() === "")
-    throw new ApiError(501, "Email is required");
+  if (!username || username.trim() === "") throw new ApiError(400, "Name is required");
   if (!password || password.trim() === "")
-    throw new ApiError(502, "Password is required");
-  try {
-    const existedUser = await User.findOne({
-      email: email,
-    });
-    if (existedUser) {
-      throw new ApiError(409, "Unable to create user, user already exists");
-    }
-    bcrypt.hash(password, 10, (err, hash) => {
-      if (err) {
-        console.error("Error hashing password:", err);
-        return res.status(503).json({
-          error: err
-        });
-      }
-      const user = new User({
-        username: username,
-        email: email,
-        password: hash,
-        subscription: "Free",
-      });
-      user.save()
-        .then(async (result) => {
-          // Create system collections for the new user
-          try {
-            await createSystemCollections(result._id);
-            console.log(`System collections created for user ${result._id}`);
-          } catch (error) {
-            console.error("Error creating system collections:", error);
-            // Don't fail the registration if system collections fail
-          }
-          
-          res.status(201).json({
-            message: "user created"
-          });
-        })
-        .catch(err => {
-          console.error("Error saving user:", err);
-          res.status(504).json({
-            error: err
-          });
-        });
-    });
-  } catch (error) {
-    console.error("Error registering user:", error);
-    throw new ApiError(500, "Internal Server Error");
+    throw new ApiError(400, "Password is required");
+
+  const normalizedEmail = assertMeeshoEmail(email);
+  const existedUser = await User.findOne({ email: normalizedEmail });
+
+  if (existedUser) {
+    throw new ApiError(409, "An account already exists for this email.");
   }
+
+  const hash = await bcrypt.hash(password, 10);
+  const user = new User({
+    username: username.trim(),
+    email: normalizedEmail,
+    password: hash,
+    subscription: "Free",
+    authProvider: "password",
+    emailVerified: false,
+  });
+
+  const result = await user.save();
+
+  try {
+    await createSystemCollections(result._id);
+    console.log(`System collections created for user ${result._id}`);
+  } catch (error) {
+    console.error("Error creating system collections:", error);
+  }
+
+  res.status(201).json({
+    message: "user created",
+    emailVerificationRequired: true,
+  });
 });
 
 export const loginUser = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
 
-  if (!email || email.trim() === "") {
-    throw new ApiError(400, "Email is required");
-  }
   if (!password || password.trim() === "") {
     throw new ApiError(400, "Password is required");
   }
 
-  const user = await User.findOne({
-    email: email,
-  })
+  const normalizedEmail = assertMeeshoEmail(email);
+  const user = await User.findOne({ email: normalizedEmail });
+
   if (!user) {
     throw new ApiError(401, "Invalid credentials");
   }
 
-  bcrypt.compare(password, user.password, (err, result) => {
-    if (err) {
-      throw new ApiError(401, "Invalid credentials");
-    }
-    if (result) {
-      const token = jwt.sign(
-        {
-          email: user.email,
-          userId: user._id
-        },
-        process.env.JWT_KEY,
-      );
-      res.cookie('jwtToken', token, {
-        sameSite: 'None', httpOnly: true, secure: process.env.NODE_ENV === 'production', maxAge: 3600*1000*2
-      });
-      return res.status(200).send({
-        message: 'Auth successful',
-        token: token,
-        user,
-      });
-    }
-    return res.status(401).json({
-      message: 'Auth failed'
-    });
+  const isPasswordValid = await bcrypt.compare(password, user.password);
+
+  if (!isPasswordValid) {
+    throw new ApiError(401, "Invalid credentials");
+  }
+
+  const token = signAuthToken(user);
+  res.cookie('jwtToken', token, {
+    sameSite: 'None', httpOnly: true, secure: process.env.NODE_ENV === 'production', maxAge: 3600*1000*2
+  });
+
+  return res.status(200).send({
+    message: 'Auth successful',
+    token: token,
+    user,
   });
 });
 
 export const googleAuthHandler = asyncHandler(async (req, res) => {
-  const { email, username } = req.body;
-  
-  if (!email || email.trim() === "") {
-    throw new ApiError(400, "Email is required");
+  const { email, username, emailVerified } = req.body;
+  const normalizedEmail = assertMeeshoEmail(email);
+
+  if (emailVerified !== true) {
+    throw new ApiError(
+      403,
+      "Google did not return a verified work email. Please use a verified @meesho.com account."
+    );
   }
 
   try {
     // Check if user exists with this email
-    let user = await User.findOne({ email });
+    let user = await User.findOne({ email: normalizedEmail });
     
     if (!user) {
       // Create new user if it doesn't exist
       const hash = await bcrypt.hash(process.env.GOOGLE_AUTH_PASSWORD, 10);
       
       user = new User({
-        username: username || email.split('@')[0],
-        email,
+        username: username || normalizedEmail.split('@')[0],
+        email: normalizedEmail,
         password: hash,
         subscription: "Free",
+        authProvider: "google",
+        emailVerified: true,
         Links: {
           oldLink: [],
           newLink: []
@@ -151,16 +159,16 @@ export const googleAuthHandler = asyncHandler(async (req, res) => {
         if (!user.Links.newLink) user.Links.newLink = [];
         await user.save();
       }
+
+      if (!user.emailVerified || user.authProvider !== "google") {
+        user.emailVerified = true;
+        user.authProvider = "google";
+        await user.save();
+      }
     }
     
     // Generate token and send response
-    const token = jwt.sign(
-      {
-        email: user.email,
-        userId: user._id
-      },
-      process.env.JWT_KEY,
-    );
+    const token = signAuthToken(user);
     
     res.cookie('jwtToken', token, {
       sameSite: 'None', 
@@ -176,6 +184,7 @@ export const googleAuthHandler = asyncHandler(async (req, res) => {
     });
   } catch (error) {
     console.error("Error in Google authentication:", error);
+    if (error instanceof ApiError) throw error;
     throw new ApiError(500, "Authentication failed");
   }
 });

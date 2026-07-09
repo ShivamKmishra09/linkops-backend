@@ -17,6 +17,15 @@ const userSchema = mongoose.Schema({
     required: true,
     default: "Abc@1234",
   },
+  authProvider: {
+    type: String,
+    enum: ["password", "google"],
+    default: "password",
+  },
+  emailVerified: {
+    type: Boolean,
+    default: false,
+  },
   subscription: {
     type: String,
     enum: ["Free", "Premium"],
