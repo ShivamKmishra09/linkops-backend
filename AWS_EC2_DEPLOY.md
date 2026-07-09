@@ -50,7 +50,7 @@ nano .env.production
 Fill at least:
 
 ```env
-DB_URL=
+DB_URL=mongodb+srv://USER:PASSWORD@CLUSTER.mongodb.net/linkops?retryWrites=true&w=majority
 JWT_KEY=
 SESSION_SECRET=
 BIFROST_API_KEY=
@@ -58,6 +58,9 @@ AUTH_PROFILE_ENCRYPTION_KEY=
 CONNECTOR_ENCRYPTION_KEY=
 REACT_APP_FRONTEND_URL=https://linkops-frontend.vercel.app
 ```
+
+If the MongoDB Atlas password contains special characters such as `@`, encode
+them in the URL. For example, `@` becomes `%40`.
 
 For local Redis inside Compose, do not set `REDIS_URL` in `.env.production`; the compose file sets it to `redis://redis:6379`.
 
