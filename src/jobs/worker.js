@@ -11,6 +11,7 @@ import {
   markKnowledgeAssetFailed,
   upsertKnowledgeAssetFromAnalysis,
 } from "../services/knowledgeAssetService.js";
+import { getBullRedisConnection } from "./redisConnection.js";
 
 // --- 3. CREATE AN ASYNC FUNCTION TO START THE WORKER ---
 const startWorker = async () => {
@@ -25,7 +26,7 @@ const startWorker = async () => {
     );
     process.exit(1); // Exit if DB connection fails
   }
-  const connection = process.env?.REDIS_URL || "redis://localhost:6379";
+  const connection = getBullRedisConnection();
 
   const queueEvents = new QueueEvents("link-analysis", { connection });
   queueEvents.on("waiting", ({ jobId }) =>

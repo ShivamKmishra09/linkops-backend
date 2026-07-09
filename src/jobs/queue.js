@@ -1,7 +1,8 @@
 import { Queue } from "bullmq";
 import "dotenv/config";
+import { getBullRedisConnection } from "./redisConnection.js";
 
-const connection = process.env?.REDIS_URL || "redis://localhost:6379";
+const connection = getBullRedisConnection();
 
 export const analysisQueue = new Queue("link-analysis", {
   connection,
