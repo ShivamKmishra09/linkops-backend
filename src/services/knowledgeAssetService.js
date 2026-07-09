@@ -58,6 +58,49 @@ const ROLE_PRESETS = {
   leadership: ["dashboard", "prd", "krd", "rca"],
 };
 
+const KNOWLEDGE_PACKS = {
+  engineering_onboarding: {
+    title: "Engineering onboarding",
+    role: "engineering",
+    description: "Repos, runbooks, architecture docs, incidents, and setup links for engineers joining or rotating into a team.",
+    assetTypes: ["github_repo", "runbook", "doc", "incident", "rca"],
+    keywords: ["onboarding", "setup", "architecture", "runbook", "incident", "repo"],
+    requiredTypes: ["github_repo", "runbook", "doc"],
+  },
+  product_launch: {
+    title: "Product launch pack",
+    role: "product",
+    description: "PRDs, KRDs, Figma files, dashboards, and decision docs needed to understand a launch.",
+    assetTypes: ["prd", "krd", "figma", "dashboard", "doc"],
+    keywords: ["launch", "prd", "krd", "experiment", "figma", "metric"],
+    requiredTypes: ["prd", "krd", "figma"],
+  },
+  data_review: {
+    title: "Data review pack",
+    role: "data",
+    description: "Dashboards, sheets, metric definitions, and decision-support docs for analysis reviews.",
+    assetTypes: ["dashboard", "sheet", "doc", "prd", "krd"],
+    keywords: ["dashboard", "metric", "report", "analysis", "dataset", "sheet"],
+    requiredTypes: ["dashboard", "sheet"],
+  },
+  incident_response: {
+    title: "Incident response pack",
+    role: "ops",
+    description: "Runbooks, incident docs, RCA links, and dashboards for fast recovery during production issues.",
+    assetTypes: ["runbook", "incident", "rca", "dashboard", "github_issue"],
+    keywords: ["incident", "rca", "runbook", "outage", "rollback", "war room"],
+    requiredTypes: ["runbook", "incident", "rca"],
+  },
+  support_ops: {
+    title: "Support operations pack",
+    role: "support",
+    description: "SOPs, playbooks, onboarding docs, and support dashboards for repeated business operations.",
+    assetTypes: ["sop", "runbook", "onboarding", "dashboard", "doc"],
+    keywords: ["support", "seller", "sop", "playbook", "ticket", "escalation"],
+    requiredTypes: ["sop", "runbook"],
+  },
+};
+
 const clean = (value = "") => String(value || "").replace(/\s\s+/g, " ").trim();
 
 const normalizeUrl = (url) => {
@@ -190,8 +233,8 @@ const extractFreshness = ({ text = "", updatedAt }) => {
     staleRisk,
     reason:
       staleRisk === "low"
-        ? "The saved link was updated recently in Linkly."
-        : "Freshness is inferred from when the saved link was last updated in Linkly.",
+        ? "The saved link was updated recently in LinkOps."
+        : "Freshness is inferred from when the saved link was last updated in LinkOps.",
   };
 };
 
@@ -521,7 +564,7 @@ export const updateAssetForUser = async ({ ownerId, assetId, updates }) => {
   });
   if (updates.freshness) allowed.freshness = updates.freshness;
 
-  const updated = await KnowledgeAsset.findOneAndUpdate(
+  let updated = await KnowledgeAsset.findOneAndUpdate(
     { _id: assetId, owner: ownerId },
     { $set: allowed },
     { new: true }
@@ -529,8 +572,32 @@ export const updateAssetForUser = async ({ ownerId, assetId, updates }) => {
 
   if (!updated) return null;
   const link = { longUrl: updated.canonicalUrl, shortId: "" };
+  const missingInfo = inferMissingInfo({
+    ownerTeam: updated.ownerTeam,
+    assetType: updated.assetType,
+    sourceOfTruth: updated.sourceOfTruth,
+    freshness: updated.freshness,
+  });
+
+  updated = {
+    ...updated,
+    missingInfo,
+    reliability: {
+      ...(updated.reliability || {}),
+      missingOwner: !updated.ownerTeam,
+    },
+  };
   updated.searchText = buildSearchText({ link, asset: updated });
-  await KnowledgeAsset.updateOne({ _id: updated._id }, { $set: { searchText: updated.searchText } });
+  await KnowledgeAsset.updateOne(
+    { _id: updated._id },
+    {
+      $set: {
+        searchText: updated.searchText,
+        missingInfo,
+        "reliability.missingOwner": !updated.ownerTeam,
+      },
+    }
+  );
   return updated;
 };
 
@@ -759,6 +826,65 @@ export const organizeAssetsIntoSuggestedCollections = async ({ ownerId }) => {
   };
 };
 
+export const getKnowledgePacksForUser = async ({ ownerId }) => {
+  const assets = await KnowledgeAsset.find({ owner: ownerId })
+    .populate("link", "shortId longUrl viewerCount collections createdAt updatedAt analysisStatus")
+    .sort({ updatedAt: -1 })
+    .lean();
+
+  return Object.entries(KNOWLEDGE_PACKS).map(([key, definition]) =>
+    buildKnowledgePack({ key, definition, assets })
+  );
+};
+
+export const createCollectionFromKnowledgePack = async ({ ownerId, packKey }) => {
+  const definition = KNOWLEDGE_PACKS[packKey];
+  if (!definition) return null;
+
+  const packs = await getKnowledgePacksForUser({ ownerId });
+  const pack = packs.find((item) => item.key === packKey);
+  if (!pack) return null;
+
+  const linkIds = pack.assets
+    .map((asset) => (typeof asset.link === "object" ? asset.link?._id : asset.link))
+    .filter(Boolean);
+
+  if (!linkIds.length) {
+    return {
+      pack,
+      collection: null,
+      linksAdded: 0,
+      message: "No analyzed links are available for this pack yet.",
+    };
+  }
+
+  const collection = await Collection.findOneAndUpdate(
+    { owner: ownerId, name: definition.title },
+    {
+      $setOnInsert: {
+        owner: ownerId,
+        name: definition.title,
+        description: definition.description,
+        color: "#10B981",
+      },
+      $addToSet: { links: { $each: linkIds } },
+    },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  ).lean();
+
+  await Link.updateMany(
+    { owner: ownerId, _id: { $in: linkIds } },
+    { $addToSet: { collections: collection._id } }
+  );
+
+  return {
+    pack,
+    collection,
+    linksAdded: linkIds.length,
+    message: `${definition.title} collection is ready.`,
+  };
+};
+
 const getWhyMatched = (asset, query) => {
   if (!query) return "Recently updated knowledge asset";
   const lower = query.toLowerCase();
@@ -773,6 +899,85 @@ const getWhyMatched = (asset, query) => {
     return "Matched employee brief";
   }
   return "Matched saved link context";
+};
+
+const buildKnowledgePack = ({ key, definition, assets }) => {
+  const scoredAssets = assets
+    .map((asset) => ({
+      asset,
+      score: scoreAssetForPack(asset, definition),
+    }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8)
+    .map((item) => ({
+      ...item.asset,
+      packReason: getPackReason(item.asset, definition),
+    }));
+
+  const presentTypes = new Set(scoredAssets.map((asset) => asset.assetType));
+  const gaps = definition.requiredTypes
+    .filter((assetType) => !presentTypes.has(assetType))
+    .map((assetType) => ({
+      assetType,
+      label: assetType.replace(/_/g, " "),
+      message: `Add a ${assetType.replace(/_/g, " ")} link to make this pack stronger.`,
+    }));
+
+  return {
+    key,
+    title: definition.title,
+    role: definition.role,
+    description: definition.description,
+    assetTypes: definition.assetTypes,
+    keywords: definition.keywords,
+    requiredTypes: definition.requiredTypes,
+    readiness: Math.round(
+      ((definition.requiredTypes.length - gaps.length) /
+        Math.max(definition.requiredTypes.length, 1)) *
+        100
+    ),
+    assets: scoredAssets,
+    gaps,
+  };
+};
+
+const scoreAssetForPack = (asset, definition) => {
+  let score = 0;
+  if (definition.assetTypes.includes(asset.assetType)) score += 4;
+  if (asset.audiences?.includes(definition.role)) score += 3;
+  if (asset.sourceOfTruth === "yes") score += 1;
+  if (asset.freshness?.staleRisk === "low") score += 1;
+
+  const text = [
+    asset.title,
+    asset.employeeBrief?.whatThisIs,
+    asset.employeeBrief?.whyItMatters,
+    asset.tags?.join(" "),
+    asset.searchPhrases?.join(" "),
+    asset.ownerTeam,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  definition.keywords.forEach((keyword) => {
+    if (text.includes(keyword)) score += 1;
+  });
+
+  if (Number(asset.reliability?.duplicateCandidateCount || 0) > 0) score -= 1;
+  if (asset.analysisStatus !== "COMPLETED") score -= 3;
+  return score;
+};
+
+const getPackReason = (asset, definition) => {
+  if (definition.assetTypes.includes(asset.assetType)) {
+    return `Fits ${definition.title} as ${asset.assetType.replace(/_/g, " ")}`;
+  }
+  if (asset.audiences?.includes(definition.role)) {
+    return `Relevant for ${definition.role}`;
+  }
+  return "Matched pack keywords";
 };
 
 const getWhyRelated = (source, candidate) => {

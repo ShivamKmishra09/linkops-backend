@@ -1,0 +1,45 @@
+services:
+  api:
+    build: .
+    container_name: linkops-api
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      NODE_ENV: production
+      PORT: 8000
+      REDIS_URL: redis://redis:6379
+      REACT_APP_FRONTEND_URL: https://linkops-frontend.vercel.app
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_started
+
+  worker:
+    build: .
+    container_name: linkops-worker
+    restart: unless-stopped
+    command: ["node", "src/jobs/worker.js"]
+    env_file:
+      - .env.production
+    environment:
+      NODE_ENV: production
+      REDIS_URL: redis://redis:6379
+      REACT_APP_FRONTEND_URL: https://linkops-frontend.vercel.app
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+    depends_on:
+      redis:
+        condition: service_started
+
+  redis:
+    image: redis:7-alpine
+    container_name: linkops-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:

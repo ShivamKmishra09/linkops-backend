@@ -15,7 +15,7 @@ import { getUsableAuthProfile } from "../services/authProfileService.js";
 
 const updateViewerCount = async (web_id) => {
   try {
-    const fullShortUrl = `${process.env.REACT_APP_FRONTEND_URL}/linkly/${web_id}`;
+    const fullShortUrl = `${process.env.REACT_APP_FRONTEND_URL}/l/${web_id}`;
     const user = await User.findOne({ "Links.newLink": fullShortUrl });
     if (user) {
       const index = user.Links.newLink.indexOf(fullShortUrl);
@@ -119,7 +119,7 @@ export const handleRedirect = asyncHandler(async (req, res) => {
   }
 
   if (!linkData.isPublic) {
-    return res.redirect(302, `${process.env.REACT_APP_FRONTEND_URL}/linkly/${web_id}`);
+    return res.redirect(302, `${process.env.REACT_APP_FRONTEND_URL}/l/${web_id}`);
   }
 
   // --- 4. THE NEW SAFETY CHECK ---
@@ -318,7 +318,7 @@ export const addurl = asyncHandler(async (req, res) => {
         message: shouldRefreshAnalysis
           ? "Link refreshed successfully"
           : "Link already exists",
-        shortUrl: `${process.env.REACT_APP_FRONTEND_URL}/linkly/${existingLink.shortId}`,
+        shortUrl: `${process.env.REACT_APP_FRONTEND_URL}/l/${existingLink.shortId}`,
         link: existingLink,
         isCustom: existingLink.shortId === customShortId,
       });
@@ -388,7 +388,7 @@ export const addurl = asyncHandler(async (req, res) => {
     });
     res.status(200).json({
       message: "Link added successfully",
-      shortUrl: `${process.env.REACT_APP_FRONTEND_URL}/linkly/${shortId}`,
+      shortUrl: `${process.env.REACT_APP_FRONTEND_URL}/l/${shortId}`,
       link: newLink,
       isCustom: !!customShortId,
     });
@@ -578,7 +578,7 @@ export const editShortUrl = asyncHandler(async (req, res) => {
 
     res.status(200).json({
       message: "Short URL updated successfully",
-      newShortUrl: `${process.env.REACT_APP_FRONTEND_URL}/linkly/${newShortId}`,
+      newShortUrl: `${process.env.REACT_APP_FRONTEND_URL}/l/${newShortId}`,
     });
   } catch (err) {
     console.error("Error in editShortUrl:", err);

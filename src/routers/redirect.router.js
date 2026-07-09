@@ -23,6 +23,8 @@ router
 router
   .route("/loggedin/:user_id/urls")
   .get(checkForUserAuthentication, geturls);
+router.route("/l/:web_id").get(handleRedirect);
+router.route("/l/:web_id/resolve").get(resolveShortLink);
 router.route("/linkly/:web_id").get(handleRedirect);
 router.route("/linkly/:web_id/resolve").get(resolveShortLink);
 router

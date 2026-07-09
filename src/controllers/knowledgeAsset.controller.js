@@ -4,9 +4,11 @@ import { asyncHandler } from "../utilities/asyncHandler.js";
 import { ApiError } from "../utilities/ApiError.js";
 import {
   backfillKnowledgeAssetsForUser,
+  createCollectionFromKnowledgePack,
   getAssetForUser,
   getAssetsForUser,
   getKnowledgeInsightsForUser,
+  getKnowledgePacksForUser,
   getRelatedAssetsForUser,
   organizeAssetsIntoSuggestedCollections,
   searchAssetsForUser,
@@ -172,6 +174,35 @@ export const getKnowledgeInsights = asyncHandler(async (req, res) => {
   res.status(200).json({
     success: true,
     insights,
+  });
+});
+
+export const getKnowledgePacks = asyncHandler(async (req, res) => {
+  const userId = assertOwnUserRoute(req);
+  await backfillKnowledgeAssetsForUser({ ownerId: userId });
+  const packs = await getKnowledgePacksForUser({ ownerId: userId });
+
+  res.status(200).json({
+    success: true,
+    packs,
+  });
+});
+
+export const createKnowledgePackCollection = asyncHandler(async (req, res) => {
+  const userId = assertOwnUserRoute(req);
+  await backfillKnowledgeAssetsForUser({ ownerId: userId });
+  const result = await createCollectionFromKnowledgePack({
+    ownerId: userId,
+    packKey: req.params.packKey,
+  });
+
+  if (!result) {
+    throw new ApiError(404, "Knowledge pack not found.");
+  }
+
+  res.status(200).json({
+    success: true,
+    ...result,
   });
 });
 

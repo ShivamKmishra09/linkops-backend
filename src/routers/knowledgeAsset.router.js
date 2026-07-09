@@ -1,9 +1,11 @@
 import { Router } from "express";
 import { checkForUserAuthentication } from "../middleware/auth.middleware.js";
 import {
+  createKnowledgePackCollection,
   getAsset,
   getKnowledgeHealth,
   getKnowledgeInsights,
+  getKnowledgePacks,
   getRelatedAssets,
   listAssets,
   organizeSuggestedCollections,
@@ -37,6 +39,14 @@ router
 router
   .route("/loggedin/:user_id/knowledge-insights")
   .get(checkForUserAuthentication, getKnowledgeInsights);
+
+router
+  .route("/loggedin/:user_id/knowledge-packs")
+  .get(checkForUserAuthentication, getKnowledgePacks);
+
+router
+  .route("/loggedin/:user_id/knowledge-packs/:packKey/collection")
+  .post(checkForUserAuthentication, createKnowledgePackCollection);
 
 router
   .route("/loggedin/:user_id/organize-suggested-collections")

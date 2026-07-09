@@ -1,4 +1,3 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import puppeteer from "puppeteer";
 import "dotenv/config";
 import {
@@ -7,7 +6,18 @@ import {
 } from "./authProfileService.js";
 import { fetchConnectorContentForUrl } from "./connectorService.js";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const AI_API_KEY =
+  process.env.BIFROST_API_KEY ||
+  process.env.OPENAI_API_KEY ||
+  process.env.GEMINI_API_KEY;
+const AI_MODEL = process.env.OPENAI_MODEL || process.env.BIFROST_MODEL || "gpt-4o";
+const rawAiEndpoint =
+  process.env.OPENAI_CHAT_COMPLETIONS_URL ||
+  process.env.BIFROST_CHAT_COMPLETIONS_URL ||
+  "https://gateway-buildathon.ltl.sh/v1/chat/completions";
+const AI_CHAT_COMPLETIONS_URL = rawAiEndpoint.startsWith("http")
+  ? rawAiEndpoint
+  : `https://${rawAiEndpoint}`;
 
 const summaryPromptTemplate = `You are an assistant that summarizes the content of webpages. 
     The following text is the scraped content from a given URL. 
@@ -149,7 +159,7 @@ async function scrapeTextFromUrl(url, options = {}) {
 }
 
 // --- ⭐ NEW: A Resilient Function to Call the AI with Retries ⭐ ---
-async function generateContentWithRetry(model, prompt) {
+async function generateContentWithRetry(prompt) {
   const maxRetries = 5;
   const baseDelaySeconds = 2; // base for exponential backoff
 
@@ -158,7 +168,45 @@ async function generateContentWithRetry(model, prompt) {
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      return await model.generateContent(prompt);
+      const response = await fetch(AI_CHAT_COMPLETIONS_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${AI_API_KEY}`,
+          "x-bf-vk": AI_API_KEY,
+        },
+        body: JSON.stringify({
+          model: AI_MODEL,
+          messages: [
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+          temperature: 0.2,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        const error = new Error(
+          `AI provider returned ${response.status}: ${errorText.slice(0, 500)}`
+        );
+        error.status = response.status;
+        throw error;
+      }
+
+      const data = await response.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content) {
+        throw new Error("AI provider returned no message content.");
+      }
+
+      return {
+        response: {
+          text: () => content,
+        },
+      };
     } catch (error) {
       // Normalize status detection across error shapes
       const status = error?.status || error?.response?.status || null;
@@ -222,7 +270,7 @@ async function generateContentWithRetry(model, prompt) {
 }
 
 // --- 2. MapReduce Pipeline for Long Text Summarization ---
-async function getSummarizationFromChunks(text, model, finalSummaryUserPrompt) {
+async function getSummarizationFromChunks(text, finalSummaryUserPrompt) {
   const tokenLimit = 3000 * 4;
   const textChunks = [];
   for (let i = 0; i < text.length; i += tokenLimit) {
@@ -237,7 +285,7 @@ async function getSummarizationFromChunks(text, model, finalSummaryUserPrompt) {
   const chunkSummaries = [];
   for (const chunk of textChunks) {
     const prompt = `This is a snippet from a larger document. Summarize its main points concisely. Snippet: """${chunk}"""`;
-    const result = await generateContentWithRetry(model, prompt);
+    const result = await generateContentWithRetry(prompt);
     chunkSummaries.push(result.response.text());
     console.log(
       `Summarized chunk ${chunkSummaries.length} of ${textChunks.length}.`
@@ -252,7 +300,7 @@ async function getSummarizationFromChunks(text, model, finalSummaryUserPrompt) {
     "${text}",
     combinedSummaries
   );
-  const finalResult = await generateContentWithRetry(model, finalSummaryPrompt); // Use retry function
+  const finalResult = await generateContentWithRetry(finalSummaryPrompt); // Use retry function
   return finalResult.response.text();
 }
 
@@ -320,25 +368,23 @@ export async function analyzeUrlContent(url, options = {}) {
     };
   }
 
-  if (!process.env.GEMINI_API_KEY) {
+  if (!AI_API_KEY) {
     return {
       summary:
-        "AI analysis is disabled because GEMINI_API_KEY is not configured. The link was saved and can still be organized manually.",
+        "AI analysis is disabled because no Bifrost/OpenAI API key is configured. The link was saved and can still be organized manually.",
       tags: ["manual-review"],
       safety: {
         safety_rating: 3,
         justification:
-          "No Gemini API key is configured, so automated safety analysis was skipped.",
+          "No Bifrost/OpenAI API key is configured, so automated safety analysis was skipped.",
       },
       classification: {
         category: "Other Work Links",
         confidence: 0.5,
-        reason: "AI classification skipped because GEMINI_API_KEY is missing.",
+        reason: "AI classification skipped because no Bifrost/OpenAI API key is configured.",
       },
     };
   }
-
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
   try {
     let summaryData, safety, classification;
@@ -356,7 +402,7 @@ export async function analyzeUrlContent(url, options = {}) {
         Text to analyze: """${text}"""
       `;
 
-      const result = await generateContentWithRetry(model, combinedPrompt); // Use retry function
+      const result = await generateContentWithRetry(combinedPrompt); // Use retry function
       const fullResponse = JSON.parse(
         result.response
           .text()
@@ -373,7 +419,6 @@ export async function analyzeUrlContent(url, options = {}) {
       console.log("Text is long. Using chunking pipeline (robust path).");
       const summaryJsonText = await getSummarizationFromChunks(
         text,
-        model,
         summaryPromptTemplate
       );
       summaryData = JSON.parse(
@@ -386,11 +431,9 @@ export async function analyzeUrlContent(url, options = {}) {
       const firstChunk = text.slice(0, 8000);
       // Use the retry wrapper for safety and classification calls as well
       const safetyResult = await generateContentWithRetry(
-        model,
         safetyPromptTemplate.replace("${text}", firstChunk)
       );
       const classificationResult = await generateContentWithRetry(
-        model,
         classificationPromptTemplate.replace("${text}", firstChunk)
       );
 

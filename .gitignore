@@ -3,6 +3,7 @@
 
 # Environment Variables
 .env
+.env.production
 
 # IDE - VSCode
 .vscode/
